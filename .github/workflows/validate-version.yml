@@ -1,0 +1,83 @@
+name: GitFlow Version Manager
+
+on:
+  pull_request:
+    branches:
+      - main
+      - 'release/**'
+      - develop
+
+jobs:
+  version-management:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write       # Necesario para crear commits
+      pull-requests: write  # Necesario para crear el PR automático
+
+    steps:
+      - name: Checkout del código
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+          ref: ${{ github.head_ref }} # Hace checkout de la rama del PR (ej. feature/mi-rama)
+
+      - name: Validar versión y calcular incremento
+        id: version_check
+        run: |
+          # 1. Extraer versión de la rama destino (main, develop, release/*)
+          BASE_VERSION=$(git show origin/${{ github.base_ref }}:release.properties 2>/dev/null | grep -E '^version=' | cut -d'=' -f2 || echo "0.0.0")
+          
+          # 2. Extraer versión de la rama actual (el PR original)
+          HEAD_VERSION=$(grep -E '^version=' release.properties | cut -d'=' -f2)
+          
+          echo "BASE_VERSION=$BASE_VERSION" >> $GITHUB_ENV
+          echo "HEAD_VERSION=$HEAD_VERSION" >> $GITHUB_ENV
+          
+          # 3. Comparar usando sort -V para evaluar semántica
+          HIGHEST_VERSION=$(printf "%s\n%s" "$BASE_VERSION" "$HEAD_VERSION" | sort -V | tail -n1)
+
+          if [ "$BASE_VERSION" == "$HEAD_VERSION" ] || [ "$HIGHEST_VERSION" != "$HEAD_VERSION" ]; then
+            echo "::warning::La versión no ha sido incrementada o es inferior. Se requiere auto-incremento."
+            
+            # Separar MAJOR.MINOR.PATCH (Asume formato X.Y.Z)
+            IFS='.' read -ra VER <<< "$BASE_VERSION"
+            MAJOR=${VER[0]:-0}
+            MINOR=${VER[1]:-0}
+            PATCH=${VER[2]:-0}
+            
+            # Incrementar versión. (Aquí puedes ajustar si en 'develop' quieres saltar MINOR en vez de PATCH)
+            NEXT_PATCH=$((PATCH + 1))
+            NEW_VERSION="$MAJOR.$MINOR.$NEXT_PATCH"
+            
+            echo "NEW_VERSION=$NEW_VERSION" >> $GITHUB_ENV
+            echo "increment_needed=true" >> $GITHUB_OUTPUT
+            
+            # Modificar el archivo localmente para el PR
+            sed -i "s/^version=.*/version=$NEW_VERSION/" release.properties
+          else
+            echo "increment_needed=false" >> $GITHUB_OUTPUT
+            echo "✅ La versión ha sido incrementada correctamente por el desarrollador ($BASE_VERSION -> $HEAD_VERSION)."
+          fi
+
+      - name: Generar PR Automático para incremento
+        if: steps.version_check.outputs.increment_needed == 'true'
+        uses: peter-evans/create-pull-request@v6
+        with:
+          token: ${{ secrets.GITHUB_TOKEN }}
+          commit-message: "chore: incremento automático de versión a ${{ env.NEW_VERSION }}"
+          title: "🚀 Incremento automático de versión a ${{ env.NEW_VERSION }}"
+          body: |
+            Se detectó que la versión en el PR coincidia o era inferior a la rama base (`${{ github.base_ref }}`). 
+            
+            **Versión detectada:** `${{ env.BASE_VERSION }}`
+            **Nueva versión:** `${{ env.NEW_VERSION }}`
+            
+            Fusiona este PR para actualizar tu rama y poder completar el proceso de GitFlow.
+          branch: "chore/bump-version-${{ env.NEW_VERSION }}-${{ github.run_id }}"
+          base: ${{ github.head_ref }} # Lanza el PR hacia la rama de la característica/fix actual
+
+      - name: Bloquear el merge por colisión de versión
+        if: steps.version_check.outputs.increment_needed == 'true'
+        run: |
+          echo "::error::La versión (${{ env.HEAD_VERSION }}) colisiona con la rama destino. Se ha generado un PR automático hacia tu rama para subir la versión a ${{ env.NEW_VERSION }}. Por favor aprueba ese PR y esta validación pasará."
+          exit 1
